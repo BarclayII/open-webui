@@ -170,25 +170,65 @@ class WebSearchAgent(ChatAgent):
             "type": "function",
             "function": {
                 "name": "search_web",
-                "description": "Search the web for current information",
+                "description": "Search the web for current information and return file references for further processing",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "queries": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Search queries to execute"
+                        "query": {
+                            "type": "string",
+                            "description": "Search query or topic to search for"
                         }
                     },
-                    "required": ["queries"]
+                    "required": ["query"]
                 }
             }
         }
     
     async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
-        queries = params.get("queries", [])
+        query = params.get("query", "")
         
-        # Emit status
+        # Generate search queries using existing logic
+        await context.event_emitter({
+            "type": "status",
+            "data": {
+                "action": "web_search",
+                "description": "Generating search queries",
+                "done": False,
+            },
+        })
+        
+        try:
+            # Use existing query generation logic
+            res = await generate_queries(
+                context.request,
+                {
+                    "model": context.metadata.get("model"),
+                    "messages": context.messages,
+                    "prompt": query,
+                    "type": "web_search",
+                },
+                context.user,
+            )
+            
+            response = res["choices"][0]["message"]["content"]
+            try:
+                bracket_start = response.find("{")
+                bracket_end = response.rfind("}") + 1
+                if bracket_start != -1 and bracket_end != -1:
+                    response = response[bracket_start:bracket_end]
+                    queries = json.loads(response).get("queries", [])
+                else:
+                    queries = [response]
+            except:
+                queries = [response]
+                
+            if not queries or (len(queries) == 1 and queries[0].strip() == ""):
+                queries = [query]
+                
+        except Exception as e:
+            queries = [query]
+        
+        # Execute web search
         await context.event_emitter({
             "type": "status",
             "data": {
@@ -198,7 +238,6 @@ class WebSearchAgent(ChatAgent):
             },
         })
         
-        # Use existing web search logic
         results = await process_web_search(
             context.request,
             SearchForm(queries=queries),
@@ -236,9 +275,9 @@ class WebSearchAgent(ChatAgent):
         })
         
         return AgentResult(
-            content=f"Web search completed for queries: {', '.join(queries)}",
+            content=f"Web search completed for '{query}'. Found {len(results.get('filenames', []))} sources. Use query_documents to retrieve specific information from these sources.",
             files=files,
-            metadata={"urls": results.get("filenames", []), "queries": queries}
+            metadata={"urls": results.get("filenames", []), "queries": queries, "original_query": query}
         )
 ```
 
@@ -410,13 +449,13 @@ class RAGAgent(ChatAgent):
             "type": "function",
             "function": {
                 "name": "query_documents",
-                "description": "Query uploaded documents and knowledge base for relevant information",
+                "description": "Query uploaded documents, knowledge base, and web search results for relevant information",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Query to search in documents"
+                            "description": "Query to search in documents and knowledge sources"
                         },
                         "k": {
                             "type": "integer",
@@ -433,60 +472,185 @@ class RAGAgent(ChatAgent):
         query = params.get("query", "")
         k = params.get("k", 5)
         
+        # Get files from context metadata (includes uploaded files, web search results, etc.)
         files = context.metadata.get("files", [])
         if not files:
             return AgentResult(
-                content="No documents available to query",
+                content="No documents or sources available to query. Try uploading documents or using web search first.",
                 metadata={"files_count": 0}
             )
         
-        # Use existing RAG logic
-        sources = get_sources_from_items(
-            request=context.request,
-            items=files,
-            queries=[query],
-            embedding_function=lambda q, prefix: context.app_state.EMBEDDING_FUNCTION(
-                q, prefix=prefix, user=context.user
-            ),
-            k=k,
-            # ... other RAG parameters
-        )
+        # Generate retrieval queries using existing logic
+        try:
+            queries_response = await generate_queries(
+                context.request,
+                {
+                    "model": context.metadata.get("model"),
+                    "messages": context.messages,
+                    "type": "retrieval",
+                },
+                context.user,
+            )
+            queries_response = queries_response["choices"][0]["message"]["content"]
+            
+            try:
+                bracket_start = queries_response.find("{")
+                bracket_end = queries_response.rfind("}") + 1
+                if bracket_start != -1 and bracket_end != -1:
+                    queries_response = queries_response[bracket_start:bracket_end]
+                    queries = json.loads(queries_response).get("queries", [])
+                else:
+                    queries = [queries_response]
+            except:
+                queries = [queries_response]
+                
+            if not queries:
+                queries = [query]
+        except:
+            queries = [query]
         
+        # Use existing RAG logic with ThreadPoolExecutor for performance
+        try:
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor() as executor:
+                sources = await loop.run_in_executor(
+                    executor,
+                    lambda: get_sources_from_items(
+                        request=context.request,
+                        items=files,
+                        queries=queries,
+                        embedding_function=lambda q, prefix: context.app_state.EMBEDDING_FUNCTION(
+                            q, prefix=prefix, user=context.user
+                        ),
+                        k=k,
+                        reranking_function=(
+                            (lambda sentences: context.app_state.RERANKING_FUNCTION(
+                                sentences, user=context.user
+                            )) if context.app_state.RERANKING_FUNCTION else None
+                        ),
+                        k_reranker=context.app_state.config.TOP_K_RERANKER,
+                        r=context.app_state.config.RELEVANCE_THRESHOLD,
+                        hybrid_bm25_weight=context.app_state.config.HYBRID_BM25_WEIGHT,
+                        hybrid_search=context.app_state.config.ENABLE_RAG_HYBRID_SEARCH,
+                        full_context=context.app_state.config.RAG_FULL_CONTEXT,
+                        user=context.user,
+                    ),
+                )
+        except Exception as e:
+            return AgentResult(
+                content=f"Error retrieving information: {str(e)}",
+                metadata={"error": str(e), "query": query}
+            )
+        
+        if not sources:
+            return AgentResult(
+                content=f"No relevant information found for query: '{query}'",
+                metadata={"query": query, "sources_count": 0}
+            )
+        
+        # Format retrieved context
         context_string = ""
+        citation_idx_map = {}
+        
         for source in sources:
             if "document" in source:
                 for document_text, document_metadata in zip(
                     source["document"], source["metadata"]
                 ):
                     source_name = source.get("source", {}).get("name", "Unknown")
-                    context_string += f"Source: {source_name}\n{document_text}\n\n"
+                    source_id = (
+                        document_metadata.get("source", None)
+                        or source.get("source", {}).get("id", None)
+                        or "N/A"
+                    )
+                    
+                    if source_id not in citation_idx_map:
+                        citation_idx_map[source_id] = len(citation_idx_map) + 1
+                    
+                    context_string += (
+                        f'<source id="{citation_idx_map[source_id]}"'
+                        + (f' name="{source_name}"' if source_name else "")
+                        + f">{document_text}</source>\n"
+                    )
+        
+        context_string = context_string.strip()
         
         return AgentResult(
-            content=f"Retrieved relevant information:\n\n{context_string}",
+            content=f"Retrieved relevant information for '{query}':\n\n{context_string}",
             sources=sources,
-            metadata={"query": query, "sources_count": len(sources)}
+            metadata={
+                "query": query,
+                "sources_count": len(sources),
+                "queries_used": queries,
+                "citation_map": citation_idx_map
+            }
         )
 ```
+
+## Agent Interaction Patterns
+
+### Web Search + RAG Workflow
+With Option A (separate agents), the typical workflow becomes:
+
+1. **LLM decides to search web**: Calls `search_web` agent
+2. **Web Search Agent**:
+   - Generates optimized search queries
+   - Executes web search
+   - Returns file references (not content)
+   - Stores results in shared context
+3. **LLM decides to query results**: Calls `query_documents` agent
+4. **RAG Agent**:
+   - Accesses web search files from context
+   - Generates retrieval queries
+   - Performs embedding/retrieval on web content
+   - Returns formatted context with citations
+
+### Agent Context Sharing
+```python
+class ChatContext(BaseModel):
+    user: UserModel
+    request: Request
+    messages: List[Dict]
+    metadata: Dict[str, Any]  # Shared state between agents
+    app_state: Any
+    event_emitter: Callable
+    event_caller: Callable
+    
+    # Agent results are stored in metadata["files"] for cross-agent access
+    def add_files(self, files: List[Dict]):
+        if "files" not in self.metadata:
+            self.metadata["files"] = []
+        self.metadata["files"].extend(files)
+```
+
+### Agent Dependencies
+While agents are independent, they can work together through shared context:
+- **Web Search** → populates `metadata["files"]` with web sources
+- **RAG** → processes any files in `metadata["files"]` (uploaded docs + web results)
+- **Memory** → adds context to conversation history
+- **Code/Image** → independent operations
 
 ## Migration Strategy
 
 ### Phase 1: Foundation (Week 1-2)
 - [ ] Create agent base classes and interfaces
 - [ ] Implement agent registry system
-- [ ] Create chat context wrapper
+- [ ] Create chat context wrapper with shared state
 - [ ] Add agent loading mechanism to `process_chat_payload()`
 - [ ] Keep existing handlers as fallback
 
 ### Phase 2: Agent Implementation (Week 3-4)
-- [ ] Implement Memory Agent
-- [ ] Implement Web Search Agent  
-- [ ] Implement Image Generation Agent
-- [ ] Implement Code Interpreter Agent
-- [ ] Implement RAG Agent
+- [ ] Implement Memory Agent (independent)
+- [ ] Implement Web Search Agent (populates shared files)
+- [ ] Implement RAG Agent (consumes shared files)
+- [ ] Implement Image Generation Agent (independent)
+- [ ] Implement Code Interpreter Agent (independent)
 - [ ] Add agents to tools_dict in parallel with existing handlers
 
 ### Phase 3: Integration Testing (Week 5)
-- [ ] Test agent-based flow alongside existing flow
+- [ ] Test individual agent functionality
+- [ ] Test web search → RAG agent workflow
+- [ ] Test agent combinations and shared context
 - [ ] Add feature flag to switch between old/new systems
 - [ ] Performance testing and optimization
 - [ ] User acceptance testing
@@ -499,9 +663,10 @@ class RAGAgent(ChatAgent):
 
 ### Phase 5: Enhancement (Week 7+)
 - [ ] Add agent composition capabilities
-- [ ] Implement agent dependencies
+- [ ] Implement explicit agent dependencies
 - [ ] Add agent configuration UI
 - [ ] Performance monitoring and analytics
+- [ ] Smart agent suggestion based on context
 
 ## Implementation Details
 
@@ -536,19 +701,25 @@ agent_registry = AgentRegistry()
 async def process_chat_payload(request, form_data, user, metadata, model):
     # ... existing setup code ...
     
-    # Load agents into tools_dict
-    agent_tools = agent_registry.get_all_tools()
-    
-    # Create chat context
+    # Create chat context with shared state
     context = ChatContext(
         user=user,
         request=request,
         messages=form_data["messages"],
-        metadata=metadata,
+        metadata=metadata,  # This will be shared between agents
         app_state=request.app.state,
         event_emitter=event_emitter,
         event_caller=event_call
     )
+    
+    # Load agents into tools_dict with context binding
+    agent_tools = {}
+    for name, agent in agent_registry.get_all_agents().items():
+        agent_tools[name] = {
+            "spec": agent.get_tool_spec(),
+            "callable": lambda params, ctx=context, ag=agent: ag.execute(params, ctx),
+            "agent": agent
+        }
     
     # Add agent tools to existing tools_dict
     tools_dict.update(agent_tools)
@@ -565,6 +736,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         )
         sources.extend(flags.get("sources", []))
     
+    # Handle any files added by agents (e.g., web search results)
+    if context.metadata.get("files"):
+        form_data["metadata"]["files"] = context.metadata["files"]
+    
     # ... rest of existing code ...
 ```
 
@@ -573,20 +748,31 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 ### Unit Tests
 - [ ] Test each agent implementation independently
 - [ ] Test agent registry functionality
-- [ ] Test chat context creation and usage
+- [ ] Test chat context creation and shared state
 - [ ] Test tool specification generation
+- [ ] Test agent context sharing mechanisms
 
 ### Integration Tests
+- [ ] Test web search → RAG agent workflow
 - [ ] Test agent execution within chat flow
 - [ ] Test multiple agent combinations
+- [ ] Test shared context between agents
 - [ ] Test error handling and fallbacks
 - [ ] Test performance under load
 
 ### End-to-End Tests
 - [ ] Test complete chat flows with agents
+- [ ] Test web search + document query scenarios
 - [ ] Test UI integration with new agent system
 - [ ] Test backward compatibility during migration
 - [ ] Test feature parity with old system
+
+### Agent Workflow Tests
+- [ ] Test: Web search → Query documents workflow
+- [ ] Test: Memory + RAG combination
+- [ ] Test: Code execution with document context
+- [ ] Test: Image generation with web research
+- [ ] Test: Error handling when agents fail
 
 ## Success Metrics
 
