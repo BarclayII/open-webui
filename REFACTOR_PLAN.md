@@ -360,12 +360,16 @@ class ImageGenerationAgent(ChatAgent):
 class CodeInterpreterAgent(ChatAgent):
     name = "execute_code"
     
+    def __init__(self):
+        self.sessions = {}  # session_id -> executor instance
+        self.engine = None  # Will be set from config
+    
     def get_tool_spec(self) -> Dict[str, Any]:
         return {
             "type": "function",
             "function": {
                 "name": "execute_code",
-                "description": "Execute Python code and return the results",
+                "description": "Execute Python code with persistent session state. Variables and imports persist across multiple executions within the same chat session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -373,10 +377,15 @@ class CodeInterpreterAgent(ChatAgent):
                             "type": "string",
                             "description": "Python code to execute"
                         },
-                        "language": {
-                            "type": "string",
-                            "description": "Programming language (currently only 'python' supported)",
-                            "default": "python"
+                        "reset_session": {
+                            "type": "boolean",
+                            "description": "Reset the Python session state (clear all variables)",
+                            "default": False
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Execution timeout in seconds",
+                            "default": 30
                         }
                     },
                     "required": ["code"]
@@ -384,59 +393,165 @@ class CodeInterpreterAgent(ChatAgent):
             }
         }
     
+    def _get_or_create_session(self, session_id: str, context: ChatContext):
+        """Get or create executor session for persistent state"""
+        if session_id not in self.sessions:
+            if context.app_state.config.CODE_INTERPRETER_ENGINE == "pyodide":
+                self.sessions[session_id] = PyodideSessionExecutor(session_id)
+            elif context.app_state.config.CODE_INTERPRETER_ENGINE == "jupyter":
+                self.sessions[session_id] = JupyterSessionExecutor(
+                    session_id,
+                    context.app_state.config.CODE_INTERPRETER_JUPYTER_URL,
+                    context.app_state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN,
+                    context.app_state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD,
+                    context.app_state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
+                )
+            else:
+                raise Exception("Code interpreter engine not configured")
+        return self.sessions[session_id]
+    
     async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
         code = params.get("code", "")
-        language = params.get("language", "python")
+        reset_session = params.get("reset_session", False)
+        timeout = params.get("timeout", 30)
         
-        if language != "python":
+        session_id = context.metadata.get("session_id")
+        if not session_id:
             return AgentResult(
-                content="Only Python code execution is currently supported",
-                metadata={"error": "Unsupported language"}
+                content="Code execution requires a valid session",
+                metadata={"error": "No session ID"}
             )
         
         try:
-            # Use existing code execution logic
-            if context.app_state.config.CODE_INTERPRETER_ENGINE == "pyodide":
-                output = await context.event_caller({
-                    "type": "execute:python",
-                    "data": {
-                        "id": str(uuid4()),
-                        "code": code,
-                        "session_id": context.metadata.get("session_id", None),
-                    },
-                })
-            elif context.app_state.config.CODE_INTERPRETER_ENGINE == "jupyter":
-                output = await execute_code_jupyter(
-                    context.app_state.config.CODE_INTERPRETER_JUPYTER_URL,
-                    code,
-                    # ... other jupyter params
-                )
-            else:
-                output = {"stdout": "Code interpreter engine not configured."}
+            # Reset session if requested
+            if reset_session and session_id in self.sessions:
+                await self.sessions[session_id].reset()
+                del self.sessions[session_id]
             
-            result_content = ""
-            if isinstance(output, dict):
-                stdout = output.get("stdout", "")
-                stderr = output.get("stderr", "")
-                result = output.get("result", "")
-                
-                if stdout:
-                    result_content += f"Output:\n{stdout}\n"
-                if stderr:
-                    result_content += f"Errors:\n{stderr}\n"
-                if result:
-                    result_content += f"Result:\n{result}\n"
+            # Get or create session executor
+            executor = self._get_or_create_session(session_id, context)
+            
+            # Apply security restrictions
+            if CODE_INTERPRETER_BLOCKED_MODULES:
+                code = self._apply_module_restrictions(code)
+            
+            # Execute code with timeout
+            output = await executor.execute(code, timeout=timeout)
+            
+            # Process output (handle images, format results)
+            formatted_output = self._format_output(output, context)
             
             return AgentResult(
-                content=f"Code executed successfully:\n```python\n{code}\n```\n\n{result_content}",
-                metadata={"output": output}
+                content=f"```python\n{code}\n```\n\n{formatted_output}",
+                metadata={
+                    "execution_result": output,
+                    "session_id": session_id,
+                    "variables_count": len(executor.get_variables()) if hasattr(executor, 'get_variables') else 0
+                }
             )
             
         except Exception as e:
             return AgentResult(
-                content=f"Code execution failed: {str(e)}",
-                metadata={"error": str(e)}
+                content=f"Code execution failed:\n```python\n{code}\n```\n\nError: {str(e)}",
+                metadata={"error": str(e), "session_id": session_id}
             )
+    
+    def _apply_module_restrictions(self, code: str) -> str:
+        """Apply module import restrictions"""
+        blocking_code = textwrap.dedent(f"""
+            import builtins
+            BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
+            
+            _real_import = builtins.__import__
+            def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if name.split('.')[0] in BLOCKED_MODULES:
+                    importer_name = globals.get('__name__') if globals else None
+                    if importer_name == '__main__':
+                        raise ImportError(f"Direct import of module {{name}} is restricted.")
+                return _real_import(name, globals, locals, fromlist, level)
+            
+            builtins.__import__ = restricted_import
+        """)
+        return blocking_code + "\n" + code
+    
+    def _format_output(self, output: dict, context: ChatContext) -> str:
+        """Format execution output for display"""
+        result_content = ""
+        
+        if isinstance(output, dict):
+            stdout = output.get("stdout", "")
+            stderr = output.get("stderr", "")
+            result = output.get("result", "")
+            
+            # Handle base64 images in output
+            if stdout and "data:image/png;base64" in stdout:
+                stdout_lines = stdout.split("\n")
+                for idx, line in enumerate(stdout_lines):
+                    if "data:image/png;base64" in line:
+                        # Convert to image URL (reuse existing logic)
+                        image_data, content_type = load_b64_image_data(line)
+                        if image_data is not None:
+                            image_url = upload_image(
+                                context.request, image_data, content_type,
+                                context.metadata, context.user
+                            )
+                            stdout_lines[idx] = f"![Output Image]({image_url})"
+                stdout = "\n".join(stdout_lines)
+            
+            if stdout:
+                result_content += f"**Output:**\n```\n{stdout}\n```\n\n"
+            if stderr:
+                result_content += f"**Errors:**\n```\n{stderr}\n```\n\n"
+            if result:
+                result_content += f"**Result:**\n```\n{result}\n```\n\n"
+        
+        return result_content.strip() or "Code executed successfully (no output)"
+
+# Session executor classes
+class PyodideSessionExecutor:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.variables = {}
+    
+    async def execute(self, code: str, timeout: int = 30) -> dict:
+        # Implementation for Pyodide execution with session state
+        pass
+    
+    async def reset(self):
+        self.variables.clear()
+    
+    def get_variables(self) -> dict:
+        return self.variables
+
+class JupyterSessionExecutor:
+    def __init__(self, session_id: str, url: str, token: str, password: str, timeout: int):
+        self.session_id = session_id
+        self.url = url
+        self.token = token
+        self.password = password
+        self.timeout = timeout
+        self.kernel_id = None
+    
+    async def execute(self, code: str, timeout: int = 30) -> dict:
+        # Reuse existing JupyterCodeExecuter but maintain kernel across calls
+        if not self.kernel_id:
+            await self._init_kernel()
+        
+        # Execute code using existing logic but with persistent kernel
+        return await execute_code_jupyter(self.url, code, self.token, self.password, timeout)
+    
+    async def reset(self):
+        if self.kernel_id:
+            await self._cleanup_kernel()
+            self.kernel_id = None
+    
+    async def _init_kernel(self):
+        # Initialize persistent Jupyter kernel
+        pass
+    
+    async def _cleanup_kernel(self):
+        # Clean up Jupyter kernel
+        pass
 ```
 
 ### 5. RAG Agent
