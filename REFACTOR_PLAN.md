@@ -745,43 +745,331 @@ While agents are independent, they can work together through shared context:
 - **Memory** → adds context to conversation history
 - **Code/Image** → independent operations
 
+## Agent-Integrated Chat Completion Architecture
+
+### New Chat Completion Flow
+
+The current rigid pipeline will be replaced with a dynamic, LLM-controlled agent system using **streaming agent execution**:
+
+```mermaid
+graph TD
+    A[chat_completion endpoint] --> B[Authentication & Model Validation]
+    B --> C[process_chat_payload - Agent Setup]
+    C --> D[AgentRegistry.initialize_agents]
+    D --> E[Add Agents to tools_dict]
+    E --> F[generate_chat_completion - LLM Streaming]
+    F --> G[process_chat_response - Streaming Handler]
+    G --> H[LLM Reasoning Streams]
+    H --> I[Agent Call Detected]
+    I --> J[Execute Agent with Status Updates]
+    J --> K[Agent Results Fed Back to LLM]
+    K --> L[LLM Continues Streaming]
+    L --> I
+    
+    J --> J1[Agent Execution with Event Emission]
+    J1 --> J2[Update Shared AgentContext]
+    J2 --> J3[Return Results to LLM Stream]
+```
+
+### Core Architecture Components
+
+#### 1. AgentRegistry System
+**File: `backend/open_webui/utils/agents/registry.py`**
+
+```python
+class AgentRegistry:
+    """Central registry for managing all available agents"""
+    
+    def __init__(self, request, user, metadata):
+        self.request = request
+        self.user = user
+        self.metadata = metadata
+        self.agents: Dict[str, BaseAgent] = {}
+        self.context = AgentContext()
+        
+    async def initialize_agents(self) -> None:
+        """Initialize all available agents based on configuration"""
+        
+        # Memory Agent - always available
+        if self.request.app.state.config.get("ENABLE_MEMORY", True):
+            self.agents["query_memory"] = MemoryAgent(
+                self.request, self.user, self.metadata, self.context
+            )
+        
+        # Web Search Agent
+        if self.request.app.state.config.ENABLE_WEB_SEARCH:
+            self.agents["search_web"] = WebSearchAgent(
+                self.request, self.user, self.metadata, self.context
+            )
+        
+        # RAG Agent
+        if self.context.has_files():
+            self.agents["search_documents"] = RAGAgent(
+                self.request, self.user, self.metadata, self.context
+            )
+        
+        # Image Generation Agent
+        if self.request.app.state.config.ENABLE_IMAGE_GENERATION:
+            self.agents["generate_image"] = ImageGenerationAgent(
+                self.request, self.user, self.metadata, self.context
+            )
+        
+        # Code Interpreter Agent
+        if self.request.app.state.config.ENABLE_CODE_INTERPRETER:
+            self.agents["execute_code"] = CodeInterpreterAgent(
+                self.request, self.user, self.metadata, self.context
+            )
+    
+    def get_tool_specifications(self) -> List[dict]:
+        """Generate OpenAI-compatible tool specifications for all agents"""
+        return [agent.get_tool_spec() for agent in self.agents.values()]
+    
+    async def execute_agent(self, tool_name: str, parameters: dict) -> dict:
+        """Execute a specific agent with given parameters"""
+        if tool_name not in self.agents:
+            raise ValueError(f"Agent '{tool_name}' not found")
+        
+        agent = self.agents[tool_name]
+        return await agent.execute(parameters)
+```
+
+#### 2. Streaming Agent Integration
+**File: `backend/open_webui/utils/middleware.py`**
+
+Modify [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753) to load agents into the existing tool system:
+
+```python
+async def process_chat_payload(request, form_data, user, metadata, model):
+    # ... existing preprocessing logic (lines 758-889) ...
+    
+    # NEW: Initialize agent registry
+    agent_registry = AgentRegistry(request, user, metadata)
+    await agent_registry.initialize_agents()
+    
+    # NEW: Load agents into tools_dict alongside existing tools
+    agent_tools = {}
+    for agent_name, agent in agent_registry.get_agents().items():
+        agent_tools[agent_name] = {
+            "spec": agent.get_tool_spec(),
+            "callable": agent.execute,
+            "agent": agent,
+            "context": agent_registry.get_context()
+        }
+    
+    # Add agents to existing tools_dict
+    tools_dict.update(agent_tools)
+    
+    # Store agent registry in metadata for process_chat_response
+    metadata["agent_registry"] = agent_registry
+    
+    # ... rest of existing logic (lines 965-1069) ...
+```
+
+**File: `backend/open_webui/utils/middleware.py`**
+
+Modify [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072) to handle agent execution during streaming:
+
+```python
+# In tool execution section (lines 2274-2314), replace with:
+if tool_name in tools:
+    tool = tools[tool_name]
+    
+    # Check if this is an agent
+    if "agent" in tool:
+        agent = tool["agent"]
+        agent_context = tool["context"]
+        
+        # Emit agent start event
+        await event_emitter({
+            "type": "agent_start",
+            "data": {
+                "agent": tool_name,
+                "parameters": tool_function_params
+            }
+        })
+        
+        try:
+            # Execute agent with context
+            agent_result = await agent.execute(tool_function_params, agent_context)
+            
+            # Emit agent completion event
+            await event_emitter({
+                "type": "agent_complete",
+                "data": {
+                    "agent": tool_name,
+                    "result": agent_result.content,
+                    "metadata": agent_result.metadata
+                }
+            })
+            
+            # Format result for LLM
+            tool_result = agent_result.content
+            
+        except Exception as e:
+            # Emit agent error event
+            await event_emitter({
+                "type": "agent_error",
+                "data": {
+                    "agent": tool_name,
+                    "error": str(e)
+                }
+            })
+            tool_result = f"Agent execution failed: {str(e)}"
+    
+    else:
+        # Handle regular tools (existing logic)
+        # ... existing tool execution code ...
+```
+
+#### 3. AgentContext System
+**File: `backend/open_webui/utils/agents/context.py`**
+
+```python
+class AgentContext:
+    """Shared context between agents during conversation processing"""
+    
+    def __init__(self):
+        self.files: List[dict] = []
+        self.search_results: List[dict] = []
+        self.memory_results: List[dict] = []
+        self.generated_images: List[dict] = []
+        self.code_sessions: Dict[str, Any] = {}
+        self.metadata: Dict[str, Any] = {}
+    
+    def add_files(self, files: List[dict]) -> None:
+        """Add files to shared context"""
+        self.files.extend(files)
+    
+    def has_files(self) -> bool:
+        """Check if context has files for RAG"""
+        return len(self.files) > 0
+    
+    def to_dict(self) -> dict:
+        """Convert context to dictionary for metadata storage"""
+        return {
+            "files_count": len(self.files),
+            "search_results_count": len(self.search_results),
+            "memory_results_count": len(self.memory_results),
+            "generated_images_count": len(self.generated_images),
+            "code_sessions": list(self.code_sessions.keys()),
+            "metadata": self.metadata
+        }
+```
+
+#### 4. Minimal Chat Completion Changes
+**File: `backend/open_webui/main.py`**
+
+The [`chat_completion()`](backend/open_webui/main.py:396) function requires **minimal changes** since agents integrate into the existing tool system:
+
+```python
+# NO CHANGES NEEDED to chat_completion() function
+# Agents are loaded in process_chat_payload() and executed in process_chat_response()
+# The existing flow works perfectly:
+
+async def process_chat(request, form_data, user, metadata, model):
+    try:
+        # This now includes agent loading
+        form_data, metadata, events = await process_chat_payload(
+            request, form_data, user, metadata, model
+        )
+
+        response = await chat_completion_handler(request, form_data, user)
+        
+        # This now includes agent execution during streaming
+        return await process_chat_response(
+            request, response, form_data, user, metadata, model, events, tasks
+        )
+    except Exception as e:
+        # ... existing error handling ...
+```
+
+### Key Architectural Changes
+
+#### **From Fixed Pipeline to Dynamic Streaming Selection**
+- **Before**: Features execute in hardcoded sequence during preprocessing
+- **After**: LLM dynamically chooses which agents to call during streaming response
+
+#### **From Preprocessing to Streaming Agent Execution**
+- **Before**: Features modify form_data before LLM processing
+- **After**: LLM calls agents during streaming and incorporates results in real-time
+
+#### **From Mixed Interfaces to Unified Agent Interface**
+- **Before**: Each feature has different interfaces (preprocessing, streaming tags, etc.)
+- **After**: All features implement the same BaseAgent interface integrated with existing tool system
+
+#### **Streaming Agent Execution with LLM Control**
+- LLM streams reasoning, then calls agents as needed
+- User sees LLM thinking process before each agent execution
+- Agent results feed back into LLM streaming for continued response
+- Leverages existing tool call infrastructure in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
+
+### Benefits of Streaming Agent Architecture
+
+#### **Enhanced User Experience**
+- Users see LLM reasoning before each agent call
+- Real-time status updates during agent execution
+- More engaging and transparent AI interaction
+- Natural conversation flow with visible thinking process
+
+#### **Dynamic Agent Selection**
+- LLM chooses which agents to use based on evolving context
+- Can adapt strategy based on previous agent results
+- More intelligent and context-aware feature usage
+- Better resource utilization
+
+#### **Leverages Existing Infrastructure**
+- Uses proven tool call system in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
+- Minimal changes to core chat completion flow
+- Reuses existing event emission and streaming logic
+- Lower implementation risk
+
+#### **Modular Architecture**
+- Each agent is self-contained and testable
+- Easy to add new agents or modify existing ones
+- Clear separation of concerns
+- Agents integrate seamlessly with existing tool system
+
 ## Migration Strategy
 
 ### Phase 1: Foundation (Week 1-2)
 - [ ] Create agent base classes and interfaces
 - [ ] Implement agent registry system
-- [ ] Create chat context wrapper with shared state
-- [ ] Add agent loading mechanism to `process_chat_payload()`
+- [ ] Create AgentContext for shared state management
+- [ ] **NEW**: Design agent integration with existing tool system
 - [ ] Keep existing handlers as fallback
 
 ### Phase 2: Agent Implementation (Week 3-4)
-- [ ] Implement Memory Agent (independent)
-- [ ] Implement Web Search Agent (populates shared files)
-- [ ] Implement RAG Agent (consumes shared files)
-- [ ] Implement Image Generation Agent (independent)
-- [ ] Implement Code Interpreter Agent (independent)
-- [ ] Add agents to tools_dict in parallel with existing handlers
+- [ ] Implement Memory Agent (migrate from [`chat_memory_handler()`](backend/open_webui/utils/middleware.py:324))
+- [ ] Implement Web Search Agent (migrate from [`chat_web_search_handler()`](backend/open_webui/utils/middleware.py:363))
+- [ ] Implement RAG Agent (migrate from [`chat_completion_files_handler()`](backend/open_webui/utils/middleware.py:626))
+- [ ] Implement Image Generation Agent (migrate from [`chat_image_generation_handler()`](backend/open_webui/utils/middleware.py:525))
+- [ ] Implement Code Interpreter Agent (session-based, no streaming tags)
+- [ ] **NEW**: Integrate agents into existing tool call system
 
-### Phase 3: Integration Testing (Week 5)
-- [ ] Test individual agent functionality
-- [ ] Test web search → RAG agent workflow
-- [ ] Test agent combinations and shared context
+### Phase 3: Integration (Week 5)
+- [ ] **NEW**: Modify [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753) to load agents into tools_dict
+- [ ] **NEW**: Modify [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072) to handle agent execution
+- [ ] Test agent execution during LLM streaming
+- [ ] Test agent event emission and status updates
 - [ ] Add feature flag to switch between old/new systems
 - [ ] Performance testing and optimization
 - [ ] User acceptance testing
 
 ### Phase 4: Migration (Week 6)
+- [ ] **NEW**: Remove hardcoded feature handlers from [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753)
+- [ ] **NEW**: Update tool execution logic in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
 - [ ] Default to agent-based system
-- [ ] Remove old hardcoded feature handlers
-- [ ] Clean up deprecated code
+- [ ] Clean up deprecated handler functions
+- [ ] Update configuration system
 - [ ] Update documentation
 
 ### Phase 5: Enhancement (Week 7+)
 - [ ] Add agent composition capabilities
-- [ ] Implement explicit agent dependencies
-- [ ] Add agent configuration UI
+- [ ] Implement agent configuration UI
 - [ ] Performance monitoring and analytics
 - [ ] Smart agent suggestion based on context
+- [ ] **NEW**: Enhanced streaming agent status updates
+- [ ] **NEW**: Agent approval workflows for sensitive operations
 
 ## Implementation Details
 
