@@ -2,16 +2,30 @@
 
 ## Executive Summary
 
-This document outlines the refactor plan to transform Open WebUI's chat processing from a hardcoded feature pipeline to a dynamic, LLM-driven agent system where external features (memory, web search, image generation, code interpreter, RAG) are treated as invocable tools/agents.
+This document outlines the refactor plan to transform Open WebUI's chat processing from a hardcoded feature pipeline to a dynamic, LLM-driven tool system where features (memory, web search, image generation, code interpreter, RAG) are converted to invocable tools that leverage the existing iterative tool call infrastructure.
+
+**Key Discovery**: Open WebUI already has sophisticated iterative tool calling in [`process_chat_response()`](backend/open_webui/utils/middleware.py:2212-2386). We just need to convert features to tools rather than build new infrastructure.
 
 ## Current Architecture Analysis
 
 ### Current Flow
 ```
-Chat Request → process_chat_payload() → Fixed Feature Pipeline → process_chat_response()
+Chat Request → process_chat_payload() → Fixed Feature Pipeline → chat_completion_handler() → process_chat_response()
+                                                                                                    ↳ Already handles iterative tool calls!
 ```
 
-### Current Feature Pipeline (Fixed Order)
+### Existing Iterative Tool Call Infrastructure ✅
+
+**Key Discovery**: [`process_chat_response()`](backend/open_webui/utils/middleware.py:2212-2386) already implements sophisticated iterative tool calling:
+
+- ✅ **Multiple tool call rounds**: Loop until no more tools needed
+- ✅ **LLM continuation**: Feeds tool results back to LLM for next iteration  
+- ✅ **Proper message history**: Builds OpenAI-compatible tool call messages
+- ✅ **Streaming preservation**: Maintains streaming during tool execution
+- ✅ **Retry limits**: [`CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES`](backend/open_webui/utils/middleware.py:101) prevents infinite loops
+- ✅ **Error handling**: Graceful tool failure handling
+
+### Current Feature Pipeline (Fixed Order in process_chat_payload)
 1. **Pipeline Inlet Filter** - External pipeline processing
 2. **Filter Inlet Functions** - Custom function filters  
 3. **Memory Handler** - Query user memory, inject context
@@ -27,122 +41,85 @@ Chat Request → process_chat_payload() → Fixed Feature Pipeline → process_c
 - **Core Processing**: [`main.py:495`](backend/open_webui/main.py:495) - `process_chat()`
 - **Payload Processing**: [`middleware.py:753`](backend/open_webui/utils/middleware.py:753) - `process_chat_payload()`
 - **Response Processing**: [`middleware.py:1072`](backend/open_webui/utils/middleware.py:1072) - `process_chat_response()`
+- **Iterative Tool Loop**: [`middleware.py:2212-2386`](backend/open_webui/utils/middleware.py:2212-2386) - Existing tool call system
 
-### Current Feature Handlers
-| Feature | Handler Function | Location | Input/Output |
-|---------|------------------|----------|--------------|
-| Memory | `chat_memory_handler()` | `middleware.py:324` | Modifies `form_data["messages"]` |
-| Web Search | `chat_web_search_handler()` | `middleware.py:363` | Adds to `form_data["files"]` |
-| Image Generation | `chat_image_generation_handler()` | `middleware.py:525` | Modifies `form_data["messages"]` |
-| Code Interpreter | Inline setup | `middleware.py:907` | Modifies `form_data["messages"]` |
-| RAG/Files | `chat_completion_files_handler()` | `middleware.py:626` | Returns sources for context |
-| Tools | `chat_completion_tools_handler()` | `middleware.py:128` | Processes tool calls |
+### Current Feature Handlers (To Be Converted)
+| Feature | Handler Function | Location | Current Behavior | Target Tool |
+|---------|------------------|----------|------------------|-------------|
+| Memory | [`chat_memory_handler()`](backend/open_webui/utils/middleware.py:324) | Preprocessing | Modifies `form_data["messages"]` | `query_memory` tool |
+| Web Search | [`chat_web_search_handler()`](backend/open_webui/utils/middleware.py:363) | Preprocessing | Adds to `form_data["files"]` | `search_web` tool |
+| Image Generation | [`chat_image_generation_handler()`](backend/open_webui/utils/middleware.py:525) | Preprocessing | Modifies `form_data["messages"]` | `generate_image` tool |
+| Code Interpreter | Inline setup | [`middleware.py:907`](backend/open_webui/utils/middleware.py:907) | Adds system prompt | `execute_code` tool |
+| RAG/Files | [`chat_completion_files_handler()`](backend/open_webui/utils/middleware.py:626) | Preprocessing | Returns sources for context | `query_documents` tool |
 
 ### Current Issues
-1. **Fixed Pipeline Order**: Features always execute in predetermined sequence
+1. **Fixed Pipeline Order**: Features execute in predetermined sequence in preprocessing
 2. **Mixed Interfaces**: Inconsistent input/output patterns across handlers
-3. **No Dynamic Discovery**: LLM cannot choose which features to use
-4. **Tight Coupling**: Features directly modify form_data structure
-5. **Limited Composability**: Cannot combine features in flexible ways
+3. **No Dynamic Discovery**: LLM cannot choose which features to use when
+4. **Preprocessing Lock-in**: Features modify form_data before LLM sees the request
+5. **Limited Iterative Capability**: Cannot chain feature usage based on results
 
 ## Target Architecture
 
-### New Flow
+### New Simplified Flow
 ```
-Chat Request → Load Available Agents → Add to tools_dict → LLM Tool Selection → Agent Execution → Response Generation
+Chat Request → process_chat_payload() → Load Feature Tools → chat_completion_handler() → process_chat_response() 
+                     ↳ Convert features to tools                                              ↳ Existing iterative tool loop
 ```
 
-### Agent-Based Design Principles
-1. **Unified Interface**: All features implement consistent agent interface
-2. **Dynamic Discovery**: LLM decides which agents to invoke
-3. **Composable**: Agents can be combined in any order
-4. **Extensible**: Easy to add new agents
-5. **Decoupled**: Agents return structured data, don't modify form_data
+### Design Principles
+1. **Leverage Existing Infrastructure**: Use proven tool call system in [`process_chat_response()`](backend/open_webui/utils/middleware.py:2212-2386)
+2. **Simple Tool Conversion**: Convert feature handlers to OpenAI-compatible tools
+3. **Dynamic LLM Selection**: LLM decides which tools to use and when
+4. **Minimal Changes**: Reuse existing streaming, events, and tool infrastructure
+5. **Backward Compatible**: Maintain all current functionality
 
-### Core Interfaces
+### Core Changes Required
 
-#### Base Agent Interface
+#### 1. Remove Fixed Feature Pipeline
+**In [`process_chat_payload()`](backend/open_webui/utils/middleware.py:890-915):**
 ```python
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List
-from pydantic import BaseModel
-
-class AgentResult(BaseModel):
-    content: str
-    metadata: Dict[str, Any] = {}
-    files: List[str] = []
-    sources: List[Dict] = []
-
-class ChatAgent(ABC):
-    @abstractmethod
-    async def execute(self, params: Dict[str, Any], context: 'ChatContext') -> AgentResult:
-        """Execute the agent with given parameters"""
-        pass
-    
-    @abstractmethod
-    def get_tool_spec(self) -> Dict[str, Any]:
-        """Return OpenAI tool specification for this agent"""
-        pass
-    
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Agent name for tool calling"""
-        pass
+# REMOVE: Fixed feature execution
+features = form_data.pop("features", None)
+if features:
+    if "memory" in features and features["memory"]:
+        form_data = await chat_memory_handler(...)  # REMOVE
+    if "web_search" in features and features["web_search"]:
+        form_data = await chat_web_search_handler(...)  # REMOVE
+    # ... etc
 ```
 
-#### Chat Context
+#### 2. Add Feature Tools to tools_dict
+**In [`process_chat_payload()`](backend/open_webui/utils/middleware.py:965-981):**
 ```python
-class ChatContext(BaseModel):
-    user: UserModel
-    request: Request
-    messages: List[Dict]
-    metadata: Dict[str, Any]
-    app_state: Any
-    event_emitter: Callable
-    event_caller: Callable
+# NEW: Convert enabled features to tools
+feature_tools = {}
+if features:
+    if features.get("memory"):
+        feature_tools["query_memory"] = create_memory_tool(request, user, extra_params)
+    if features.get("web_search"):
+        feature_tools["search_web"] = create_web_search_tool(request, user, extra_params)
+    if features.get("image_generation"):
+        feature_tools["generate_image"] = create_image_tool(request, user, extra_params)
+    if features.get("code_interpreter"):
+        feature_tools["execute_code"] = create_code_tool(request, user, extra_params)
+
+# Add feature tools to existing tools_dict
+tools_dict.update(feature_tools)
 ```
 
-## Agent Implementations
-
-### 1. Memory Agent
+#### 3. Simple Tool Creation Functions
 ```python
-class MemoryAgent(ChatAgent):
-    name = "query_memory"
-    
-    def get_tool_spec(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": "query_memory",
-                "description": "Query user's memory for relevant past conversations and context",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Query to search in user's memory"
-                        },
-                        "k": {
-                            "type": "integer",
-                            "description": "Number of memory items to retrieve",
-                            "default": 3
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }
-    
-    async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
+def create_memory_tool(request, user, extra_params):
+    async def execute_memory_query(**params):
+        # Reuse existing chat_memory_handler logic
         query = params.get("query", "")
         k = params.get("k", 3)
         
-        # Use existing memory query logic
         results = await query_memory(
-            context.request, 
+            request, 
             QueryMemoryForm(content=query, k=k), 
-            context.user
+            user
         )
         
         user_context = ""
@@ -154,100 +131,111 @@ class MemoryAgent(ChatAgent):
                     created_at = time.strftime("%Y-%m-%d", time.localtime(timestamp))
                 user_context += f"{doc_idx + 1}. [{created_at}] {doc}\n"
         
-        return AgentResult(
-            content=f"Retrieved memory context:\n{user_context}",
-            metadata={"memory_results": len(results.documents[0]) if results else 0}
-        )
-```
-
-### 2. Web Search Agent
-```python
-class WebSearchAgent(ChatAgent):
-    name = "search_web"
+        return f"Retrieved memory context:\n{user_context}"
     
-    def get_tool_spec(self) -> Dict[str, Any]:
-        return {
+    return {
+        "spec": {
             "type": "function",
             "function": {
-                "name": "search_web",
-                "description": "Search the web for current information and return file references for further processing",
+                "name": "query_memory",
+                "description": "Query user's memory for relevant past conversations",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query or topic to search for"
-                        }
+                        "query": {"type": "string", "description": "Memory search query"},
+                        "k": {"type": "integer", "description": "Number of results", "default": 3}
                     },
                     "required": ["query"]
                 }
             }
-        }
-    
-    async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
+        },
+        "callable": execute_memory_query
+    }
+```
+
+## Feature Tool Implementations
+
+### 1. Memory Tool
+**Convert [`chat_memory_handler()`](backend/open_webui/utils/middleware.py:324)**
+```python
+def create_memory_tool(request, user, extra_params):
+    async def execute_memory_query(**params):
         query = params.get("query", "")
+        k = params.get("k", 3)
         
-        # Generate search queries using existing logic
-        await context.event_emitter({
+        # Reuse existing memory query logic
+        results = await query_memory(request, QueryMemoryForm(content=query, k=k), user)
+        
+        # Format results same as current handler
+        user_context = ""
+        if results and hasattr(results, "documents"):
+            for doc_idx, doc in enumerate(results.documents[0]):
+                created_at = "Unknown Date"
+                if results.metadatas[0][doc_idx].get("created_at"):
+                    timestamp = results.metadatas[0][doc_idx]["created_at"]
+                    created_at = time.strftime("%Y-%m-%d", time.localtime(timestamp))
+                user_context += f"{doc_idx + 1}. [{created_at}] {doc}\n"
+        
+        return f"Retrieved memory context:\n{user_context}"
+    
+    return {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": "Query user's memory for relevant past conversations and context",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Query to search in user's memory"},
+                        "k": {"type": "integer", "description": "Number of memory items to retrieve", "default": 3}
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        "callable": execute_memory_query
+    }
+```
+
+### 2. Web Search Tool
+**Convert [`chat_web_search_handler()`](backend/open_webui/utils/middleware.py:363)**
+```python
+def create_web_search_tool(request, user, extra_params):
+    async def execute_web_search(**params):
+        query = params.get("query", "")
+        event_emitter = extra_params["__event_emitter__"]
+        
+        # Emit status events (same as current handler)
+        await event_emitter({
             "type": "status",
-            "data": {
-                "action": "web_search",
-                "description": "Generating search queries",
-                "done": False,
-            },
+            "data": {"action": "web_search", "description": "Searching the web", "done": False},
         })
         
+        # Generate search queries (reuse existing logic)
         try:
-            # Use existing query generation logic
-            res = await generate_queries(
-                context.request,
-                {
-                    "model": context.metadata.get("model"),
-                    "messages": context.messages,
-                    "prompt": query,
-                    "type": "web_search",
-                },
-                context.user,
-            )
+            res = await generate_queries(request, {
+                "model": extra_params["__metadata__"]["model"],
+                "messages": extra_params["__metadata__"]["messages"],
+                "prompt": query,
+                "type": "web_search",
+            }, user)
             
             response = res["choices"][0]["message"]["content"]
-            try:
-                bracket_start = response.find("{")
-                bracket_end = response.rfind("}") + 1
-                if bracket_start != -1 and bracket_end != -1:
-                    response = response[bracket_start:bracket_end]
-                    queries = json.loads(response).get("queries", [])
-                else:
-                    queries = [response]
-            except:
-                queries = [response]
-                
-            if not queries or (len(queries) == 1 and queries[0].strip() == ""):
-                queries = [query]
-                
+            # Parse queries (same logic as current handler)
+            queries = [query]  # Simplified for example
+            
         except Exception as e:
             queries = [query]
         
-        # Execute web search
-        await context.event_emitter({
-            "type": "status",
-            "data": {
-                "action": "web_search",
-                "description": "Searching the web",
-                "done": False,
-            },
-        })
+        # Execute web search (reuse existing logic)
+        results = await process_web_search(request, SearchForm(queries=queries), user=user)
         
-        results = await process_web_search(
-            context.request,
-            SearchForm(queries=queries),
-            user=context.user,
-        )
-        
+        # Store files in shared metadata for RAG tool to access later
         files = []
         if results:
             if results.get("collection_names"):
-                for col_idx, collection_name in enumerate(results.get("collection_names")):
+                for collection_name in results.get("collection_names"):
                     files.append({
                         "collection_name": collection_name,
                         "name": ", ".join(queries),
@@ -255,423 +243,101 @@ class WebSearchAgent(ChatAgent):
                         "urls": results["filenames"],
                         "queries": queries,
                     })
-            elif results.get("docs"):
-                files.append({
-                    "docs": results["docs"],
-                    "name": ", ".join(queries),
-                    "type": "web_search",
-                    "urls": results["filenames"],
-                    "queries": queries,
-                })
         
-        await context.event_emitter({
+        # Add files to metadata for other tools to access
+        if "files" not in extra_params["__metadata__"]:
+            extra_params["__metadata__"]["files"] = []
+        extra_params["__metadata__"]["files"].extend(files)
+        
+        await event_emitter({
             "type": "status",
-            "data": {
-                "action": "web_search",
-                "description": f"Searched {len(results.get('filenames', []))} sites",
-                "urls": results.get("filenames", []),
-                "done": True,
-            },
+            "data": {"action": "web_search", "description": f"Found {len(results.get('filenames', []))} sources", "done": True},
         })
         
-        return AgentResult(
-            content=f"Web search completed for '{query}'. Found {len(results.get('filenames', []))} sources. Use query_documents to retrieve specific information from these sources.",
-            files=files,
-            metadata={"urls": results.get("filenames", []), "queries": queries, "original_query": query}
-        )
-```
-
-### 3. Image Generation Agent
-```python
-class ImageGenerationAgent(ChatAgent):
-    name = "generate_image"
+        return f"Web search completed for '{query}'. Found {len(results.get('filenames', []))} sources. Use query_documents to retrieve specific information from these sources."
     
-    def get_tool_spec(self) -> Dict[str, Any]:
-        return {
+    return {
+        "spec": {
             "type": "function",
             "function": {
-                "name": "generate_image",
-                "description": "Generate an image based on a text prompt",
+                "name": "search_web",
+                "description": "Search the web for current information",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "Text prompt describing the image to generate"
-                        }
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        }
-    
-    async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
-        prompt = params.get("prompt", "")
-        
-        await context.event_emitter({
-            "type": "status",
-            "data": {"description": "Generating an image", "done": False},
-        })
-        
-        try:
-            images = await image_generations(
-                request=context.request,
-                form_data=GenerateImageForm(prompt=prompt),
-                user=context.user,
-            )
-            
-            await context.event_emitter({
-                "type": "status",
-                "data": {"description": "Generated an image", "done": True},
-            })
-            
-            await context.event_emitter({
-                "type": "files",
-                "data": {
-                    "files": [
-                        {"type": "image", "url": image["url"]}
-                        for image in images
-                    ]
-                },
-            })
-            
-            return AgentResult(
-                content="Image has been generated successfully",
-                metadata={"images": [img["url"] for img in images]}
-            )
-            
-        except Exception as e:
-            await context.event_emitter({
-                "type": "status",
-                "data": {
-                    "description": "An error occurred while generating an image",
-                    "done": True,
-                },
-            })
-            
-            return AgentResult(
-                content="Unable to generate an image, an error occurred",
-                metadata={"error": str(e)}
-            )
-```
-
-### 4. Code Interpreter Agent
-```python
-class CodeInterpreterAgent(ChatAgent):
-    name = "execute_code"
-    
-    def __init__(self):
-        self.sessions = {}  # session_id -> executor instance
-        self.engine = None  # Will be set from config
-    
-    def get_tool_spec(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": "execute_code",
-                "description": "Execute Python code with persistent session state. Variables and imports persist across multiple executions within the same chat session.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {
-                            "type": "string",
-                            "description": "Python code to execute"
-                        },
-                        "reset_session": {
-                            "type": "boolean",
-                            "description": "Reset the Python session state (clear all variables)",
-                            "default": False
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Execution timeout in seconds",
-                            "default": 30
-                        }
-                    },
-                    "required": ["code"]
-                }
-            }
-        }
-    
-    def _get_or_create_session(self, session_id: str, context: ChatContext):
-        """Get or create executor session for persistent state"""
-        if session_id not in self.sessions:
-            if context.app_state.config.CODE_INTERPRETER_ENGINE == "pyodide":
-                self.sessions[session_id] = PyodideSessionExecutor(session_id)
-            elif context.app_state.config.CODE_INTERPRETER_ENGINE == "jupyter":
-                self.sessions[session_id] = JupyterSessionExecutor(
-                    session_id,
-                    context.app_state.config.CODE_INTERPRETER_JUPYTER_URL,
-                    context.app_state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN,
-                    context.app_state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD,
-                    context.app_state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
-                )
-            else:
-                raise Exception("Code interpreter engine not configured")
-        return self.sessions[session_id]
-    
-    async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
-        code = params.get("code", "")
-        reset_session = params.get("reset_session", False)
-        timeout = params.get("timeout", 30)
-        
-        session_id = context.metadata.get("session_id")
-        if not session_id:
-            return AgentResult(
-                content="Code execution requires a valid session",
-                metadata={"error": "No session ID"}
-            )
-        
-        try:
-            # Reset session if requested
-            if reset_session and session_id in self.sessions:
-                await self.sessions[session_id].reset()
-                del self.sessions[session_id]
-            
-            # Get or create session executor
-            executor = self._get_or_create_session(session_id, context)
-            
-            # Apply security restrictions
-            if CODE_INTERPRETER_BLOCKED_MODULES:
-                code = self._apply_module_restrictions(code)
-            
-            # Execute code with timeout
-            output = await executor.execute(code, timeout=timeout)
-            
-            # Process output (handle images, format results)
-            formatted_output = self._format_output(output, context)
-            
-            return AgentResult(
-                content=f"```python\n{code}\n```\n\n{formatted_output}",
-                metadata={
-                    "execution_result": output,
-                    "session_id": session_id,
-                    "variables_count": len(executor.get_variables()) if hasattr(executor, 'get_variables') else 0
-                }
-            )
-            
-        except Exception as e:
-            return AgentResult(
-                content=f"Code execution failed:\n```python\n{code}\n```\n\nError: {str(e)}",
-                metadata={"error": str(e), "session_id": session_id}
-            )
-    
-    def _apply_module_restrictions(self, code: str) -> str:
-        """Apply module import restrictions"""
-        blocking_code = textwrap.dedent(f"""
-            import builtins
-            BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
-            
-            _real_import = builtins.__import__
-            def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-                if name.split('.')[0] in BLOCKED_MODULES:
-                    importer_name = globals.get('__name__') if globals else None
-                    if importer_name == '__main__':
-                        raise ImportError(f"Direct import of module {{name}} is restricted.")
-                return _real_import(name, globals, locals, fromlist, level)
-            
-            builtins.__import__ = restricted_import
-        """)
-        return blocking_code + "\n" + code
-    
-    def _format_output(self, output: dict, context: ChatContext) -> str:
-        """Format execution output for display"""
-        result_content = ""
-        
-        if isinstance(output, dict):
-            stdout = output.get("stdout", "")
-            stderr = output.get("stderr", "")
-            result = output.get("result", "")
-            
-            # Handle base64 images in output
-            if stdout and "data:image/png;base64" in stdout:
-                stdout_lines = stdout.split("\n")
-                for idx, line in enumerate(stdout_lines):
-                    if "data:image/png;base64" in line:
-                        # Convert to image URL (reuse existing logic)
-                        image_data, content_type = load_b64_image_data(line)
-                        if image_data is not None:
-                            image_url = upload_image(
-                                context.request, image_data, content_type,
-                                context.metadata, context.user
-                            )
-                            stdout_lines[idx] = f"![Output Image]({image_url})"
-                stdout = "\n".join(stdout_lines)
-            
-            if stdout:
-                result_content += f"**Output:**\n```\n{stdout}\n```\n\n"
-            if stderr:
-                result_content += f"**Errors:**\n```\n{stderr}\n```\n\n"
-            if result:
-                result_content += f"**Result:**\n```\n{result}\n```\n\n"
-        
-        return result_content.strip() or "Code executed successfully (no output)"
-
-# Session executor classes
-class PyodideSessionExecutor:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.variables = {}
-    
-    async def execute(self, code: str, timeout: int = 30) -> dict:
-        # Implementation for Pyodide execution with session state
-        pass
-    
-    async def reset(self):
-        self.variables.clear()
-    
-    def get_variables(self) -> dict:
-        return self.variables
-
-class JupyterSessionExecutor:
-    def __init__(self, session_id: str, url: str, token: str, password: str, timeout: int):
-        self.session_id = session_id
-        self.url = url
-        self.token = token
-        self.password = password
-        self.timeout = timeout
-        self.kernel_id = None
-    
-    async def execute(self, code: str, timeout: int = 30) -> dict:
-        # Reuse existing JupyterCodeExecuter but maintain kernel across calls
-        if not self.kernel_id:
-            await self._init_kernel()
-        
-        # Execute code using existing logic but with persistent kernel
-        return await execute_code_jupyter(self.url, code, self.token, self.password, timeout)
-    
-    async def reset(self):
-        if self.kernel_id:
-            await self._cleanup_kernel()
-            self.kernel_id = None
-    
-    async def _init_kernel(self):
-        # Initialize persistent Jupyter kernel
-        pass
-    
-    async def _cleanup_kernel(self):
-        # Clean up Jupyter kernel
-        pass
-```
-
-### 5. RAG Agent
-```python
-class RAGAgent(ChatAgent):
-    name = "query_documents"
-    
-    def get_tool_spec(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": "query_documents",
-                "description": "Query uploaded documents, knowledge base, and web search results for relevant information",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Query to search in documents and knowledge sources"
-                        },
-                        "k": {
-                            "type": "integer",
-                            "description": "Number of relevant chunks to retrieve",
-                            "default": 5
-                        }
+                        "query": {"type": "string", "description": "Search query or topic to search for"}
                     },
                     "required": ["query"]
                 }
             }
-        }
-    
-    async def execute(self, params: Dict[str, Any], context: ChatContext) -> AgentResult:
+        },
+        "callable": execute_web_search
+    }
+```
+
+### 3. RAG/Documents Tool
+**Convert [`chat_completion_files_handler()`](backend/open_webui/utils/middleware.py:626)**
+```python
+def create_rag_tool(request, user, extra_params):
+    async def execute_document_query(**params):
         query = params.get("query", "")
         k = params.get("k", 5)
         
-        # Get files from context metadata (includes uploaded files, web search results, etc.)
-        files = context.metadata.get("files", [])
+        # Get files from shared metadata (includes uploaded files, web search results)
+        files = extra_params["__metadata__"].get("files", [])
         if not files:
-            return AgentResult(
-                content="No documents or sources available to query. Try uploading documents or using web search first.",
-                metadata={"files_count": 0}
-            )
+            return "No documents or sources available to query. Try uploading documents or using web search first."
         
-        # Generate retrieval queries using existing logic
+        # Generate retrieval queries (reuse existing logic)
         try:
-            queries_response = await generate_queries(
-                context.request,
-                {
-                    "model": context.metadata.get("model"),
-                    "messages": context.messages,
-                    "type": "retrieval",
-                },
-                context.user,
-            )
-            queries_response = queries_response["choices"][0]["message"]["content"]
+            queries_response = await generate_queries(request, {
+                "model": extra_params["__metadata__"]["model"],
+                "messages": extra_params["__metadata__"]["messages"],
+                "type": "retrieval",
+            }, user)
             
-            try:
-                bracket_start = queries_response.find("{")
-                bracket_end = queries_response.rfind("}") + 1
-                if bracket_start != -1 and bracket_end != -1:
-                    queries_response = queries_response[bracket_start:bracket_end]
-                    queries = json.loads(queries_response).get("queries", [])
-                else:
-                    queries = [queries_response]
-            except:
-                queries = [queries_response]
-                
-            if not queries:
-                queries = [query]
+            # Parse queries (same logic as current handler)
+            queries = [query]  # Simplified for example
         except:
             queries = [query]
         
-        # Use existing RAG logic with ThreadPoolExecutor for performance
+        # Use existing RAG logic
         try:
             loop = asyncio.get_running_loop()
             with ThreadPoolExecutor() as executor:
                 sources = await loop.run_in_executor(
                     executor,
                     lambda: get_sources_from_items(
-                        request=context.request,
+                        request=request,
                         items=files,
                         queries=queries,
-                        embedding_function=lambda q, prefix: context.app_state.EMBEDDING_FUNCTION(
-                            q, prefix=prefix, user=context.user
-                        ),
+                        embedding_function=lambda q, prefix: request.app.state.EMBEDDING_FUNCTION(q, prefix=prefix, user=user),
                         k=k,
                         reranking_function=(
-                            (lambda sentences: context.app_state.RERANKING_FUNCTION(
-                                sentences, user=context.user
-                            )) if context.app_state.RERANKING_FUNCTION else None
+                            (lambda sentences: request.app.state.RERANKING_FUNCTION(sentences, user=user))
+                            if request.app.state.RERANKING_FUNCTION else None
                         ),
-                        k_reranker=context.app_state.config.TOP_K_RERANKER,
-                        r=context.app_state.config.RELEVANCE_THRESHOLD,
-                        hybrid_bm25_weight=context.app_state.config.HYBRID_BM25_WEIGHT,
-                        hybrid_search=context.app_state.config.ENABLE_RAG_HYBRID_SEARCH,
-                        full_context=context.app_state.config.RAG_FULL_CONTEXT,
-                        user=context.user,
+                        k_reranker=request.app.state.config.TOP_K_RERANKER,
+                        r=request.app.state.config.RELEVANCE_THRESHOLD,
+                        hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
+                        hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+                        full_context=request.app.state.config.RAG_FULL_CONTEXT,
+                        user=user,
                     ),
                 )
         except Exception as e:
-            return AgentResult(
-                content=f"Error retrieving information: {str(e)}",
-                metadata={"error": str(e), "query": query}
-            )
+            return f"Error retrieving information: {str(e)}"
         
         if not sources:
-            return AgentResult(
-                content=f"No relevant information found for query: '{query}'",
-                metadata={"query": query, "sources_count": 0}
-            )
+            return f"No relevant information found for query: '{query}'"
         
-        # Format retrieved context
+        # Format retrieved context (same as current handler)
         context_string = ""
         citation_idx_map = {}
         
         for source in sources:
             if "document" in source:
-                for document_text, document_metadata in zip(
-                    source["document"], source["metadata"]
-                ):
+                for document_text, document_metadata in zip(source["document"], source["metadata"]):
                     source_name = source.get("source", {}).get("name", "Unknown")
                     source_id = (
                         document_metadata.get("source", None)
@@ -688,529 +354,246 @@ class RAGAgent(ChatAgent):
                         + f">{document_text}</source>\n"
                     )
         
-        context_string = context_string.strip()
-        
-        return AgentResult(
-            content=f"Retrieved relevant information for '{query}':\n\n{context_string}",
-            sources=sources,
-            metadata={
-                "query": query,
-                "sources_count": len(sources),
-                "queries_used": queries,
-                "citation_map": citation_idx_map
+        return f"Retrieved relevant information for '{query}':\n\n{context_string.strip()}"
+    
+    return {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "query_documents",
+                "description": "Query uploaded documents, knowledge base, and web search results for relevant information",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Query to search in documents and knowledge sources"},
+                        "k": {"type": "integer", "description": "Number of relevant chunks to retrieve", "default": 5}
+                    },
+                    "required": ["query"]
+                }
             }
-        )
+        },
+        "callable": execute_document_query
+    }
 ```
 
-## Agent Interaction Patterns
-
-### Web Search + RAG Workflow
-With Option A (separate agents), the typical workflow becomes:
-
-1. **LLM decides to search web**: Calls `search_web` agent
-2. **Web Search Agent**:
-   - Generates optimized search queries
-   - Executes web search
-   - Returns file references (not content)
-   - Stores results in shared context
-3. **LLM decides to query results**: Calls `query_documents` agent
-4. **RAG Agent**:
-   - Accesses web search files from context
-   - Generates retrieval queries
-   - Performs embedding/retrieval on web content
-   - Returns formatted context with citations
-
-### Agent Context Sharing
+### 4. Image Generation Tool
+**Convert [`chat_image_generation_handler()`](backend/open_webui/utils/middleware.py:525)**
 ```python
-class ChatContext(BaseModel):
-    user: UserModel
-    request: Request
-    messages: List[Dict]
-    metadata: Dict[str, Any]  # Shared state between agents
-    app_state: Any
-    event_emitter: Callable
-    event_caller: Callable
-    
-    # Agent results are stored in metadata["files"] for cross-agent access
-    def add_files(self, files: List[Dict]):
-        if "files" not in self.metadata:
-            self.metadata["files"] = []
-        self.metadata["files"].extend(files)
-```
-
-### Agent Dependencies
-While agents are independent, they can work together through shared context:
-- **Web Search** → populates `metadata["files"]` with web sources
-- **RAG** → processes any files in `metadata["files"]` (uploaded docs + web results)
-- **Memory** → adds context to conversation history
-- **Code/Image** → independent operations
-
-## Agent-Integrated Chat Completion Architecture
-
-### New Chat Completion Flow
-
-The current rigid pipeline will be replaced with a dynamic, LLM-controlled agent system using **streaming agent execution**:
-
-```mermaid
-graph TD
-    A[chat_completion endpoint] --> B[Authentication & Model Validation]
-    B --> C[process_chat_payload - Agent Setup]
-    C --> D[AgentRegistry.initialize_agents]
-    D --> E[Add Agents to tools_dict]
-    E --> F[generate_chat_completion - LLM Streaming]
-    F --> G[process_chat_response - Streaming Handler]
-    G --> H[LLM Reasoning Streams]
-    H --> I[Agent Call Detected]
-    I --> J[Execute Agent with Status Updates]
-    J --> K[Agent Results Fed Back to LLM]
-    K --> L[LLM Continues Streaming]
-    L --> I
-    
-    J --> J1[Agent Execution with Event Emission]
-    J1 --> J2[Update Shared AgentContext]
-    J2 --> J3[Return Results to LLM Stream]
-```
-
-### Core Architecture Components
-
-#### 1. AgentRegistry System
-**File: `backend/open_webui/utils/agents/registry.py`**
-
-```python
-class AgentRegistry:
-    """Central registry for managing all available agents"""
-    
-    def __init__(self, request, user, metadata):
-        self.request = request
-        self.user = user
-        self.metadata = metadata
-        self.agents: Dict[str, BaseAgent] = {}
-        self.context = AgentContext()
+def create_image_tool(request, user, extra_params):
+    async def execute_image_generation(**params):
+        prompt = params.get("prompt", "")
+        event_emitter = extra_params["__event_emitter__"]
         
-    async def initialize_agents(self) -> None:
-        """Initialize all available agents based on configuration"""
-        
-        # Memory Agent - always available
-        if self.request.app.state.config.get("ENABLE_MEMORY", True):
-            self.agents["query_memory"] = MemoryAgent(
-                self.request, self.user, self.metadata, self.context
-            )
-        
-        # Web Search Agent
-        if self.request.app.state.config.ENABLE_WEB_SEARCH:
-            self.agents["search_web"] = WebSearchAgent(
-                self.request, self.user, self.metadata, self.context
-            )
-        
-        # RAG Agent
-        if self.context.has_files():
-            self.agents["search_documents"] = RAGAgent(
-                self.request, self.user, self.metadata, self.context
-            )
-        
-        # Image Generation Agent
-        if self.request.app.state.config.ENABLE_IMAGE_GENERATION:
-            self.agents["generate_image"] = ImageGenerationAgent(
-                self.request, self.user, self.metadata, self.context
-            )
-        
-        # Code Interpreter Agent
-        if self.request.app.state.config.ENABLE_CODE_INTERPRETER:
-            self.agents["execute_code"] = CodeInterpreterAgent(
-                self.request, self.user, self.metadata, self.context
-            )
-    
-    def get_tool_specifications(self) -> List[dict]:
-        """Generate OpenAI-compatible tool specifications for all agents"""
-        return [agent.get_tool_spec() for agent in self.agents.values()]
-    
-    async def execute_agent(self, tool_name: str, parameters: dict) -> dict:
-        """Execute a specific agent with given parameters"""
-        if tool_name not in self.agents:
-            raise ValueError(f"Agent '{tool_name}' not found")
-        
-        agent = self.agents[tool_name]
-        return await agent.execute(parameters)
-```
-
-#### 2. Streaming Agent Integration
-**File: `backend/open_webui/utils/middleware.py`**
-
-Modify [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753) to load agents into the existing tool system:
-
-```python
-async def process_chat_payload(request, form_data, user, metadata, model):
-    # ... existing preprocessing logic (lines 758-889) ...
-    
-    # NEW: Initialize agent registry
-    agent_registry = AgentRegistry(request, user, metadata)
-    await agent_registry.initialize_agents()
-    
-    # NEW: Load agents into tools_dict alongside existing tools
-    agent_tools = {}
-    for agent_name, agent in agent_registry.get_agents().items():
-        agent_tools[agent_name] = {
-            "spec": agent.get_tool_spec(),
-            "callable": agent.execute,
-            "agent": agent,
-            "context": agent_registry.get_context()
-        }
-    
-    # Add agents to existing tools_dict
-    tools_dict.update(agent_tools)
-    
-    # Store agent registry in metadata for process_chat_response
-    metadata["agent_registry"] = agent_registry
-    
-    # ... rest of existing logic (lines 965-1069) ...
-```
-
-**File: `backend/open_webui/utils/middleware.py`**
-
-Modify [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072) to handle agent execution during streaming:
-
-```python
-# In tool execution section (lines 2274-2314), replace with:
-if tool_name in tools:
-    tool = tools[tool_name]
-    
-    # Check if this is an agent
-    if "agent" in tool:
-        agent = tool["agent"]
-        agent_context = tool["context"]
-        
-        # Emit agent start event
         await event_emitter({
-            "type": "agent_start",
-            "data": {
-                "agent": tool_name,
-                "parameters": tool_function_params
-            }
+            "type": "status",
+            "data": {"description": "Generating an image", "done": False},
         })
         
         try:
-            # Execute agent with context
-            agent_result = await agent.execute(tool_function_params, agent_context)
+            # Reuse existing image generation logic
+            images = await image_generations(
+                request=request,
+                form_data=GenerateImageForm(prompt=prompt),
+                user=user,
+            )
             
-            # Emit agent completion event
             await event_emitter({
-                "type": "agent_complete",
-                "data": {
-                    "agent": tool_name,
-                    "result": agent_result.content,
-                    "metadata": agent_result.metadata
-                }
+                "type": "status",
+                "data": {"description": "Generated an image", "done": True},
             })
             
-            # Format result for LLM
-            tool_result = agent_result.content
+            await event_emitter({
+                "type": "files",
+                "data": {"files": [{"type": "image", "url": image["url"]} for image in images]},
+            })
+            
+            return "Image has been generated successfully"
             
         except Exception as e:
-            # Emit agent error event
             await event_emitter({
-                "type": "agent_error",
-                "data": {
-                    "agent": tool_name,
-                    "error": str(e)
-                }
+                "type": "status",
+                "data": {"description": "An error occurred while generating an image", "done": True},
             })
-            tool_result = f"Agent execution failed: {str(e)}"
+            
+            return "Unable to generate an image, an error occurred"
     
-    else:
-        # Handle regular tools (existing logic)
-        # ... existing tool execution code ...
+    return {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "generate_image",
+                "description": "Generate an image based on a text prompt",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "Text prompt describing the image to generate"}
+                    },
+                    "required": ["prompt"]
+                }
+            }
+        },
+        "callable": execute_image_generation
+    }
 ```
 
-#### 3. AgentContext System
-**File: `backend/open_webui/utils/agents/context.py`**
-
+### 5. Code Execution Tool
+**Convert Code Interpreter Setup**
 ```python
-class AgentContext:
-    """Shared context between agents during conversation processing"""
-    
-    def __init__(self):
-        self.files: List[dict] = []
-        self.search_results: List[dict] = []
-        self.memory_results: List[dict] = []
-        self.generated_images: List[dict] = []
-        self.code_sessions: Dict[str, Any] = {}
-        self.metadata: Dict[str, Any] = {}
-    
-    def add_files(self, files: List[dict]) -> None:
-        """Add files to shared context"""
-        self.files.extend(files)
-    
-    def has_files(self) -> bool:
-        """Check if context has files for RAG"""
-        return len(self.files) > 0
-    
-    def to_dict(self) -> dict:
-        """Convert context to dictionary for metadata storage"""
-        return {
-            "files_count": len(self.files),
-            "search_results_count": len(self.search_results),
-            "memory_results_count": len(self.memory_results),
-            "generated_images_count": len(self.generated_images),
-            "code_sessions": list(self.code_sessions.keys()),
-            "metadata": self.metadata
-        }
-```
-
-#### 4. Minimal Chat Completion Changes
-**File: `backend/open_webui/main.py`**
-
-The [`chat_completion()`](backend/open_webui/main.py:396) function requires **minimal changes** since agents integrate into the existing tool system:
-
-```python
-# NO CHANGES NEEDED to chat_completion() function
-# Agents are loaded in process_chat_payload() and executed in process_chat_response()
-# The existing flow works perfectly:
-
-async def process_chat(request, form_data, user, metadata, model):
-    try:
-        # This now includes agent loading
-        form_data, metadata, events = await process_chat_payload(
-            request, form_data, user, metadata, model
-        )
-
-        response = await chat_completion_handler(request, form_data, user)
+def create_code_tool(request, user, extra_params):
+    async def execute_code(**params):
+        code = params.get("code", "")
+        session_id = extra_params["__metadata__"].get("session_id")
         
-        # This now includes agent execution during streaming
-        return await process_chat_response(
-            request, response, form_data, user, metadata, model, events, tasks
-        )
-    except Exception as e:
-        # ... existing error handling ...
+        if not session_id:
+            return "Code execution requires a valid session"
+        
+        try:
+            # Apply security restrictions (same as current implementation)
+            if CODE_INTERPRETER_BLOCKED_MODULES:
+                blocking_code = textwrap.dedent(f"""
+                    import builtins
+                    BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
+                    
+                    _real_import = builtins.__import__
+                    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+                        if name.split('.')[0] in BLOCKED_MODULES:
+                            importer_name = globals.get('__name__') if globals else None
+                            if importer_name == '__main__':
+                                raise ImportError(f"Direct import of module {{name}} is restricted.")
+                        return _real_import(name, globals, locals, fromlist, level)
+                    
+                    builtins.__import__ = restricted_import
+                """)
+                code = blocking_code + "\n" + code
+            
+            # Execute code using existing logic
+            if request.app.state.config.CODE_INTERPRETER_ENGINE == "pyodide":
+                output = await extra_params["__event_call__"]({
+                    "type": "execute:python",
+                    "data": {"id": str(uuid4()), "code": code, "session_id": session_id},
+                })
+            elif request.app.state.config.CODE_INTERPRETER_ENGINE == "jupyter":
+                output = await execute_code_jupyter(
+                    request.app.state.config.CODE_INTERPRETER_JUPYTER_URL,
+                    code,
+                    request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN,
+                    request.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD,
+                    request.app.state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
+                )
+            else:
+                output = {"stdout": "Code interpreter engine not configured."}
+            
+            # Format output (same as current implementation)
+            result_content = ""
+            if isinstance(output, dict):
+                stdout = output.get("stdout", "")
+                stderr = output.get("stderr", "")
+                result = output.get("result", "")
+                
+                if stdout:
+                    result_content += f"**Output:**\n```\n{stdout}\n```\n\n"
+                if stderr:
+                    result_content += f"**Errors:**\n```\n{stderr}\n```\n\n"
+                if result:
+                    result_content += f"**Result:**\n```\n{result}\n```\n\n"
+            
+            return f"```python\n{code}\n```\n\n{result_content.strip() or 'Code executed successfully (no output)'}"
+            
+        except Exception as e:
+            return f"Code execution failed:\n```python\n{code}\n```\n\nError: {str(e)}"
+    
+    return {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "execute_code",
+                "description": "Execute Python code with persistent session state",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "Python code to execute"},
+                        "timeout": {"type": "integer", "description": "Execution timeout in seconds", "default": 30}
+                    },
+                    "required": ["code"]
+                }
+            }
+        },
+        "callable": execute_code
+    }
 ```
 
-### Key Architectural Changes
+## Migration Strategy (Simplified)
 
-#### **From Fixed Pipeline to Dynamic Streaming Selection**
-- **Before**: Features execute in hardcoded sequence during preprocessing
-- **After**: LLM dynamically chooses which agents to call during streaming response
+### Phase 1: Tool Conversion (Week 1-2)
+- [ ] Create feature tool conversion functions
+- [ ] Test each tool individually  
+- [ ] Ensure backward compatibility
+- [ ] Add feature flag for old vs new system
 
-#### **From Preprocessing to Streaming Agent Execution**
-- **Before**: Features modify form_data before LLM processing
-- **After**: LLM calls agents during streaming and incorporates results in real-time
+### Phase 2: Integration (Week 3)
+- [ ] Modify [`process_chat_payload()`](backend/open_webui/utils/middleware.py:890-915) to remove fixed pipeline
+- [ ] Add feature tools to existing `tools_dict`
+- [ ] Test with existing iterative tool call system
+- [ ] Performance testing
 
-#### **From Mixed Interfaces to Unified Agent Interface**
-- **Before**: Each feature has different interfaces (preprocessing, streaming tags, etc.)
-- **After**: All features implement the same BaseAgent interface integrated with existing tool system
-
-#### **Streaming Agent Execution with LLM Control**
-- LLM streams reasoning, then calls agents as needed
-- User sees LLM thinking process before each agent execution
-- Agent results feed back into LLM streaming for continued response
-- Leverages existing tool call infrastructure in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
-
-### Benefits of Streaming Agent Architecture
-
-#### **Enhanced User Experience**
-- Users see LLM reasoning before each agent call
-- Real-time status updates during agent execution
-- More engaging and transparent AI interaction
-- Natural conversation flow with visible thinking process
-
-#### **Dynamic Agent Selection**
-- LLM chooses which agents to use based on evolving context
-- Can adapt strategy based on previous agent results
-- More intelligent and context-aware feature usage
-- Better resource utilization
-
-#### **Leverages Existing Infrastructure**
-- Uses proven tool call system in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
-- Minimal changes to core chat completion flow
-- Reuses existing event emission and streaming logic
-- Lower implementation risk
-
-#### **Modular Architecture**
-- Each agent is self-contained and testable
-- Easy to add new agents or modify existing ones
-- Clear separation of concerns
-- Agents integrate seamlessly with existing tool system
-
-## Migration Strategy
-
-### Phase 1: Foundation (Week 1-2)
-- [ ] Create agent base classes and interfaces
-- [ ] Implement agent registry system
-- [ ] Create AgentContext for shared state management
-- [ ] **NEW**: Design agent integration with existing tool system
-- [ ] Keep existing handlers as fallback
-
-### Phase 2: Agent Implementation (Week 3-4)
-- [ ] Implement Memory Agent (migrate from [`chat_memory_handler()`](backend/open_webui/utils/middleware.py:324))
-- [ ] Implement Web Search Agent (migrate from [`chat_web_search_handler()`](backend/open_webui/utils/middleware.py:363))
-- [ ] Implement RAG Agent (migrate from [`chat_completion_files_handler()`](backend/open_webui/utils/middleware.py:626))
-- [ ] Implement Image Generation Agent (migrate from [`chat_image_generation_handler()`](backend/open_webui/utils/middleware.py:525))
-- [ ] Implement Code Interpreter Agent (session-based, no streaming tags)
-- [ ] **NEW**: Integrate agents into existing tool call system
-
-### Phase 3: Integration (Week 5)
-- [ ] **NEW**: Modify [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753) to load agents into tools_dict
-- [ ] **NEW**: Modify [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072) to handle agent execution
-- [ ] Test agent execution during LLM streaming
-- [ ] Test agent event emission and status updates
-- [ ] Add feature flag to switch between old/new systems
-- [ ] Performance testing and optimization
-- [ ] User acceptance testing
-
-### Phase 4: Migration (Week 6)
-- [ ] **NEW**: Remove hardcoded feature handlers from [`process_chat_payload()`](backend/open_webui/utils/middleware.py:753)
-- [ ] **NEW**: Update tool execution logic in [`process_chat_response()`](backend/open_webui/utils/middleware.py:1072)
-- [ ] Default to agent-based system
-- [ ] Clean up deprecated handler functions
-- [ ] Update configuration system
+### Phase 3: Migration (Week 4) 
+- [ ] Enable new system by default
+- [ ] Remove old feature handlers
+- [ ] Clean up deprecated code
 - [ ] Update documentation
 
-### Phase 5: Enhancement (Week 7+)
-- [ ] Add agent composition capabilities
-- [ ] Implement agent configuration UI
-- [ ] Performance monitoring and analytics
-- [ ] Smart agent suggestion based on context
-- [ ] **NEW**: Enhanced streaming agent status updates
-- [ ] **NEW**: Agent approval workflows for sensitive operations
+## Key Benefits
 
-## Implementation Details
+### 1. **Leverages Existing Infrastructure**
+- Uses proven tool call system in [`process_chat_response()`](backend/open_webui/utils/middleware.py:2212-2386)
+- No new streaming or event systems needed
+- Minimal changes to core architecture
 
-### Agent Registry
-```python
-class AgentRegistry:
-    def __init__(self):
-        self._agents: Dict[str, ChatAgent] = {}
-    
-    def register(self, agent: ChatAgent):
-        self._agents[agent.name] = agent
-    
-    def get_all_tools(self) -> Dict[str, Dict]:
-        return {
-            name: {
-                "spec": agent.get_tool_spec(),
-                "callable": agent.execute,
-                "agent": agent
-            }
-            for name, agent in self._agents.items()
-        }
-    
-    def get_agent(self, name: str) -> Optional[ChatAgent]:
-        return self._agents.get(name)
+### 2. **Dynamic Feature Selection**
+- LLM decides which tools to use and when
+- Can chain tools based on results (e.g., web search → RAG)
+- Adaptive strategy based on context
 
-# Global registry
-agent_registry = AgentRegistry()
+### 3. **Complex Reasoning Capability**
+- Multiple tool call iterations
+- Tool results inform subsequent LLM reasoning
+- Natural multi-step workflows
+
+### 4. **Simple Implementation** 
+- Convert handlers to tool callables
+- Add to existing `tools_dict`
+- Reuse all existing logic
+
+## Example Workflow
+
 ```
+User: "Search for Python tutorials and summarize the first result"
 
-### Modified process_chat_payload()
-```python
-async def process_chat_payload(request, form_data, user, metadata, model):
-    # ... existing setup code ...
-    
-    # Create chat context with shared state
-    context = ChatContext(
-        user=user,
-        request=request,
-        messages=form_data["messages"],
-        metadata=metadata,  # This will be shared between agents
-        app_state=request.app.state,
-        event_emitter=event_emitter,
-        event_caller=event_call
-    )
-    
-    # Load agents into tools_dict with context binding
-    agent_tools = {}
-    for name, agent in agent_registry.get_all_agents().items():
-        agent_tools[name] = {
-            "spec": agent.get_tool_spec(),
-            "callable": lambda params, ctx=context, ag=agent: ag.execute(params, ctx),
-            "agent": agent
-        }
-    
-    # Add agent tools to existing tools_dict
-    tools_dict.update(agent_tools)
-    
-    # Remove old hardcoded feature handling
-    # features = form_data.pop("features", None)
-    # if features:
-    #     # Old feature handlers removed
-    
-    # Let existing chat_completion_tools_handler manage everything
-    if tools_dict:
-        form_data, flags = await chat_completion_tools_handler(
-            request, form_data, extra_params, user, models, tools_dict
-        )
-        sources.extend(flags.get("sources", []))
-    
-    # Handle any files added by agents (e.g., web search results)
-    if context.metadata.get("files"):
-        form_data["metadata"]["files"] = context.metadata["files"]
-    
-    # ... rest of existing code ...
+1. LLM Response: "I'll search for Python tutorials first"
+   Tool Call: search_web(query="Python tutorials")
+
+2. Tool Execution: Returns web search results stored in metadata
+
+3. LLM Continuation: "Now let me get the content from the first result"
+   Tool Call: query_documents(query="Python tutorial content first result")
+
+4. Tool Execution: RAG retrieves content from web search results
+
+5. LLM Final: "Here's a summary of the Python tutorial: ..."
+   No more tool calls needed
 ```
-
-## Testing Strategy
-
-### Unit Tests
-- [ ] Test each agent implementation independently
-- [ ] Test agent registry functionality
-- [ ] Test chat context creation and shared state
-- [ ] Test tool specification generation
-- [ ] Test agent context sharing mechanisms
-
-### Integration Tests
-- [ ] Test web search → RAG agent workflow
-- [ ] Test agent execution within chat flow
-- [ ] Test multiple agent combinations
-- [ ] Test shared context between agents
-- [ ] Test error handling and fallbacks
-- [ ] Test performance under load
-
-### End-to-End Tests
-- [ ] Test complete chat flows with agents
-- [ ] Test web search + document query scenarios
-- [ ] Test UI integration with new agent system
-- [ ] Test backward compatibility during migration
-- [ ] Test feature parity with old system
-
-### Agent Workflow Tests
-- [ ] Test: Web search → Query documents workflow
-- [ ] Test: Memory + RAG combination
-- [ ] Test: Code execution with document context
-- [ ] Test: Image generation with web research
-- [ ] Test: Error handling when agents fail
-
-## Success Metrics
-
-### Functional
-- [ ] All existing features work as agents
-- [ ] LLM can dynamically choose which agents to use
-- [ ] Agent combinations work correctly
-- [ ] Performance is equivalent or better than current system
-
-### Technical
-- [ ] Code complexity reduced
-- [ ] Feature coupling eliminated
-- [ ] Extensibility improved
-- [ ] Test coverage maintained or improved
-
-### User Experience
-- [ ] No regression in functionality
-- [ ] Improved response relevance through dynamic agent selection
-- [ ] Better composability of features
-- [ ] Easier configuration and customization
 
 ## Risks and Mitigations
 
-### Risk: Performance Degradation
-**Mitigation**: Implement caching, optimize agent execution, performance testing
+### Risk: Performance Impact
+**Mitigation**: Existing tool system is already optimized; feature tools reuse existing logic
 
-### Risk: LLM Tool Selection Quality
-**Mitigation**: Improve tool descriptions, add examples, implement fallback logic
+### Risk: LLM Tool Selection Quality  
+**Mitigation**: Improve tool descriptions; existing system already works for external tools
 
 ### Risk: Breaking Changes
-**Mitigation**: Phased migration, feature flags, comprehensive testing
-
-### Risk: Increased Complexity
-**Mitigation**: Clear interfaces, good documentation, gradual rollout
+**Mitigation**: Feature flag for gradual migration; maintain backward compatibility
 
 ## Conclusion
 
-This refactor will transform Open WebUI from a rigid feature pipeline to a flexible, LLM-driven agent system. The migration strategy ensures minimal disruption while enabling powerful new capabilities for dynamic feature composition and extensibility.
+This simplified refactor leverages Open WebUI's existing iterative tool call infrastructure to enable complex reasoning with minimal architectural changes. By converting features to tools rather than building new agent systems, we achieve the goal of dynamic, LLM-driven feature selection while maintaining stability and reusing proven components.
